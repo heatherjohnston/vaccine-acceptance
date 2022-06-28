@@ -1,0 +1,532 @@
+---
+title: "Non-Pharmaceutical Interventions and Vaccine Hesitancy during the COVID-19 Pandemic"
+subtitle: "Adapted from UM STAT-604 Final Project"
+author: "Heather Johnston"
+date: "December 10, 2021 (Updated June 27, 2022)"
+output:
+  pdf_document:
+    citation_package: natbib
+    number_sections: yes
+  html_document:
+    df_print: paged
+header-includes: \usepackage{float}
+bibliography: bibliography.bib
+---
+
+```{r setup, include=FALSE}
+# required packages
+library(tidyverse)
+library(lubridate)
+library(httr)
+library(jsonlite)
+library(kableExtra)
+library(stargazer)
+library(ggpubr)
+
+# knitr options
+knitr::opts_chunk$set(
+  echo = FALSE,  # don't print the code chunk
+  warning = FALSE,  # don't print warnings
+  message = FALSE,  # don't print messages
+  fig.width = 6,  # set default width of figures
+  fig.height = 4,  # set default height of figures
+  fig.align = "center",  # always align figure in center
+  fig.pos = "H",  # always plot figure at the exact location of the code chunk
+  cache = TRUE)
+
+# ggplot options
+ggplot2::theme_set(theme_bw())
+
+# Relevant functions loaded below
+source("code/utils.R")
+source("code/load.R")
+source("code/clean.R")
+```
+
+
+```{r load-files}
+# NPI file:
+# download from https://frontdoor-l4uikgap6gz3m.azurefd.net/NCOV_PHM/CLEAN_PHSM?$format=csv
+# or available on web page https://www.who.int/emergencies/diseases/novel-coronavirus-2019/phsm 
+measures_orig <- read_csv("data/UN_PHSM/CLEAN_PHSM.csv")
+
+# included in zip file (not too big)
+country_codes <- read_csv("data/Global Trends and Impact Study/country_region_codes.csv")
+
+# downloaded directly from internet
+covid_cases <- read_csv("https://covid.ourworldindata.org/data/owid-covid-data.csv")
+weeks <- defineWeeks()
+```
+
+```{r load-api}
+## The below lines can be uncommented and run to call the API and save data locally
+# acceptance_orig <- loadAcceptanceDataWeeks(weeks = weeks)
+# write.csv(acceptance_orig, "data/vaccine_data_weeks.csv")
+
+## If the data is already available locally, read it in with the line below instead
+acceptance_orig <- read.csv("data/vaccine_data_weeks.csv")
+```
+
+```{r clean-data}
+# preliminary data cleaning with sourced functions
+acceptance <- cleanVaccineData(acceptance_orig)
+measures <- cleanMeasuresData(data = measures_orig, weeks = weeks, acceptance = acceptance)
+
+# join all the data together
+# simplify names and provide simple adjustments
+vaccine_data <- covid_cases %>% 
+  filter(iso_code %in% acceptance$iso_code) %>%
+  rename(cases_pm = new_cases_smoothed_per_million,
+         vaxxed_ph = people_vaccinated_per_hundred,
+         deaths_pm = new_deaths_smoothed_per_million,
+         tests_pt = new_tests_smoothed_per_thousand,
+         country = location) %>%
+  select(stringency_index, cases_pm, vaxxed_ph, deaths_pm,
+         date, iso_code, continent, country, positive_rate,
+         population) %>%
+  mutate(date = ymd(date)) %>%
+  inner_join(acceptance, on = c("iso_code", "date")) %>%
+  distinct()
+
+# Remove negative values (impossible)
+vaccine_data <- vaccine_data %>%
+  filter(cases_pm >= 0,
+         deaths_pm >= 0)
+
+# Assign tercile labels for death and case numbers
+vaccine_data <- vaccine_data %>% 
+  mutate(death_group = factor(ntile(deaths_pm, 3), 
+                              labels = c("low", "average", "high")),
+  cases_group = factor(ntile(cases_pm, 3), 
+                       labels = c("low", "average", "high")))
+
+# Join NPI data with remaining data
+measures_data <- vaccine_data %>%
+  inner_join(measures, by = c("date", "iso_code")) %>%
+  distinct()
+
+# Create measures_wide data frame for later use
+measures_wide <- measures_data %>%
+  mutate(who_measure = str_replace_all(who_measure, ",", "")) %>%
+  mutate(who_measure = str_replace_all(who_measure, "-", "")) %>%
+  mutate(who_measure = str_replace_all(who_measure, " ", "_")) %>%
+  mutate(value = presence + req) %>%
+  select(-who_category, -req) %>%
+  pivot_wider(values_from = "value", names_from = "who_measure", values_fill = 0,
+              values_fn = function(x) 1)
+
+# Identify measures with neat text
+measure_cols <- measures_data %>%
+  mutate(who_measure = str_replace_all(who_measure, ",", "")) %>%
+  mutate(who_measure = str_replace_all(who_measure, "-", "")) %>%
+  mutate(who_measure = str_replace_all(who_measure, " ", "_")) %>%
+  select(who_measure) %>%
+  unique()
+
+```
+
+
+# Introduction
+
+Since COVID-19 was identified in late 2019, countries around the world have implemented a variety of measures aimed at reducing the spread of the virus. Measures such as policies recommending or requiring social distancing or contact tracing may be referred to collectively as Non-Pharmaceutical Interventions, or NPIs. Alongside these efforts to slow the spread of the virus, teams around the world have worked to develop and produce vaccines. The rapid and successful development of several vaccines initially offered the promise of bringing the pandemic to an end. However, in addition to the challenges of producing and distributing vaccines throughout the world, public resistance to receiving vaccines has proven to be an obstacle to achieving herd immunity. 
+
+Although numerous researchers have explored the relationship between vaccine hesitancy and increase spread of the virus, as well as prolonged implementation of NPIs, another important area to explore is how NPI implementation may itself be related to vaccine hesitancy. I hypothesized that greater stringency of NPIs in a country would predict higher rates of vaccine acceptance, since people will likely feel an increased burden of COVID on their daily lives. The major confounding variable seems likely to be COVID case numbers (and deaths). Since areas with high rates of COVID seem likely to both enact more stringent NPIs and show more acceptance toward vaccines, controlling for COVID case numbers is necessary to explore whether the hypothesized relationship holds independently of COVID case numbers. 
+
+To explore this topic, I asked two related questions in this report. 
+
+*Question 1: When controlling for COVID-19 cases or deaths, is the overall stringency of NPIs implemented in a country associated with the rate of vaccine acceptance?*
+
+Hypothesis 1: I hypothesized that more stringent NPI implementation would be associated with increased acceptance of vaccines, even when controlling for the number of COVID cases or deaths. A possible causal mechanism would be that stricter NPIs underscore the need for management of the pandemic, and pose a burden on people’s daily lives, which may encourage more acceptance toward vaccines. 
+
+*Question 2: Which NPIs, if any, are associated with the rate of vaccine acceptance?*
+
+Hypothesis 2: I hypothesized that factors affecting a broader swath of the population would be associated with increased acceptance of vaccines, even when controlling for COVID cases or deaths. For example, school closures and mask mandates likely affect a wider range of people than international travel restrictions, so I hypothesized that they would be associated with greater vaccine acceptance rates. 
+
+# Data and Methodology
+
+The data about vaccine hesitancy used for this report came from The University of Maryland Social Data Science Center Global COVID-19 Trends and Impact Survey, in partnership with Facebook \citep{umd}. These data, accessed via their API, provide survey results about various metrics related to the COVID-19 pandemic, aggregated by date and country. For this project, I focused on acceptance of COVID-19 vaccines. The survey asked respondents beginning in December 2020 whether they had receive a COVID vaccine. If they had not, they were then asked whether they had an appointment to be vaccinated. If they responded no to that as well, they were asked, "If a vaccine to prevent COVID-19 were offered to you today, would you choose to get vaccinated?". For this study, I was interested in the proportion who respond that they "Yes, definitely" or "Yes, probably" would get vaccinated if offered, out of those who have not already been vaccinated and do not have an appointment to get vaccinated.
+
+Secondly, I used of Our World In Data's collection of COVID case data, which they source from Johns Hopkins University \citep{owidcoronavirus}. In particular, I used their reported total cases per million people variable, which is reported for each country daily. I used the smoothed version, which is the 7-day average. I also used their report value for new deaths attributed to COVID per million people, also smoothed over a 7-day period. Additionally, I used their reporting of the Oxford COVID-19 Government Response Tracker Stringency Index \citep{oxford}. The Stringency Index is a value between 0 and 100 computed from the implementation of what the researchers refer to as containment and closure measures. These measures consist of school closures, workplace closures, canceled public events, restrictions on gathering size, closed public transport, stay-at-home requirements, restrictions on internal movement, and restrictions on international travel \citep[p.530]{oxford}. 
+
+The third data source for this project was the World Health Organization's (WHO) collection of data about public health and social measures implemented in response to COVID-19 \citep{phsm}. This dataset includes information about NPIs implemented around the world, complied from a variety of sources and classified into a consistent taxonomy. Of this taxonomy, this study considered 6 categories: Surveillance and response measures, social and physical distancing measures, international travel measures, individual measures, environmental measures, and other measures. I omitted biological measures and drug-based measures (which include use of vaccinations and medications), as well as categories added after 2021. See Table \ref{tab:who-category-examples} for examples of the measures included in each category. More details about the meanings of these can be found in the taxonomy report \citep{phsm}. Measures which apply to smaller organizations or companies are labeled with an "enforcement" variable which indicates whether they are recommended or required. 
+
+```{r who-category-examples}
+# select relevant categories (updated 6/22)
+measure_cats <- c("Surveillance and response measures", 
+                  "Social and physical distancing measures",
+                  "International travel measures",
+                  "Environmental measures",
+                  "Other measures")
+
+tab_categories <- data.frame(category = unique(measures_orig$WHO_CATEGORY)) %>% 
+  filter(category %in% measure_cats) # only necessary after 2022 (new NPI data)
+tab_categories$measures <- NA
+
+# select measures for each category and format
+for(i in tab_categories$category){
+  tab_categories$measures[tab_categories$category == i] <- 
+    paste(paste(unique(measures_orig$WHO_MEASURE[measures_orig$WHO_CATEGORY == i])), 
+          collapse = "\n", sep = "\n")
+}
+
+# Print table
+tab_categories %>% mutate(measures = str_remove_all(measures, " outside the home")) %>%
+  mutate_all(linebreak, align = "l") %>%
+  kable(row.names = FALSE, digits = 3, escape = FALSE, format = "latex",
+      caption = "NPIs and their categories",
+      col.names = c(
+        "Category", "Specific Measure"
+      ),
+      # booktabs = TRUE, 
+      linesep = "\\addlinespace") %>%
+  kable_paper(latex_options = "striped", full_width = F)
+# Note that "adapting" means measures taken to reduce spread within schools and 
+# workplaces without outright closing them
+```
+
+## Data preparation
+
+For this project, I considered data for each country on a weekly basis. For each week from December 21, 2020 to November 15, 2021, I calculated the average proportion of unvaccinated respondents who would get a vaccine if offered for each country, weighted by the sample size for that day's Global COVID-19 Trends and Impact Survey. Furthermore, I selected the smoothed value corresponding with the Monday of each week for cases per million and deaths per million from the Our World in Data dataset. For the NPIs, I found which NPIs were in place on the Monday of the week, where each measure was scored 0 if it was not in place and 1 if it was in place (regardless of whether it was recommended or required). I considered only NPIs implemented at the national level. 
+
+I searched for and removed implausible values for each variable. For example, I found that on March 8, 2021, Spain was listed as having a negative smoothed number of new cases per million. This number should never be negative, so I removed the negative values. For the NPI dataset, I removed measures for which the reported start date is later than the reported end date. I also omitted measures which were reported as being in the "phase-out" or "finish" stages of implementation. There are also numerous combinations of countries and days which had missing values, so I considered only observations with complete cases for the metrics of interest in each step of the analysis. 
+
+## Exploratory Data Analysis
+
+As part of a preliminary exploration of the data and trends, I graphed each variable by itself and over time, before visualizing pairs of variables in combination. 
+
+```{r stringency, fig.cap="Boxplots show the distribution of stringency index values each month since December 2020."}
+vaccine_data %>%
+  mutate(month = factor(month(date), levels = c(12, 1:11), labels = month.name[c(12, 1:11)])) %>%
+  ggplot(aes(x = month, y = stringency_index)) +
+    geom_boxplot() +
+    labs(title = "Distribution of stringency index by month, Dec 2020 - Nov 2021",
+         x = "Month", y = "Oxford Government Response Tracker Stingency Index") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+As shown in Figure \ref{fig:stringency}, the median Oxford Stringency Index value declined over the course of the year, and there is a wide distribution of values present in each month.
+
+```{r accept-dist, fig.cap="Boxplots show the distribution of vaccine acceptance rates among the unvaccinated each month since December 2020."}
+vaccine_data %>%
+  mutate(month = factor(month(date), levels = c(12, 1:11), labels = month.name[c(12, 1:11)])) %>%
+  ggplot(aes(x = month, y = accept)) +
+    geom_boxplot() +
+    labs(title = "Distribution of vaccine acceptance rates, Dec 2020 - Nov 2021",
+         x = "Month", y = "Percent of unvaccinated who would accept vaccine") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+A interesting artifact from using the metric of vaccine acceptance rates among the unvaccinated is that if we assume there is some (relatively) stable number of people in the population who are vaccine-hesitant, then this metric will decrease as vaccine availability increases and the vaccine-accepting people get vaccinated. Indeed, there is a downward trend in the acceptance rate, as shown in Figure \ref{fig:accept-dist}. If my hypothesis were correct, this trend may lead to an exaggerated representation of the relationship between case rates and vaccine acceptance. When vaccination rates increase, COVID rates should theoretically decrease. Therefore, we would expect the correlation between this vaccine acceptance measure and COVID cases to be positive, at least when not accounting for the vaccination rate. Intuitively, one would expect that when case rates are higher, vaccine acceptance rates are higher as well as people may fear COVID more. 
+
+However, the hypothesized relationship between COVID rates and vaccine acceptance does not seem to exist, as shown in Figure \ref{fig:cases-accept}. Indeed, there is a negative relationship between vaccine acceptance and COVID case rates. If we consider deaths per million instead of cases per million, then the hypothesized relationship appears. I therefore proceeded to consider each separately for the models. 
+
+```{r cases-accept, fig.width=7.5, fig.cap="Acceptance is positively correlated with COVID deaths, but negatively correlated with cases. Blue lines indicate OLS model fit, and grey bands indicate confidence intervals. Note that these models collapse all time series data over the entire period."}
+ac_plot <- ggplot(vaccine_data, aes(x = cases_pm, y = accept)) +
+  geom_point(size = .5, shape = 3, alpha = .5) +
+  geom_smooth(method = "lm") +
+  labs(title = "Cases vs. vaccine acceptance",
+       x = "New COVID cases per million",
+       y = "Percent of unvaccinated who would accept vaccine")
+
+ad_plot <- ggplot(vaccine_data, aes(x = deaths_pm, y = accept)) +
+  geom_point(size = .5, shape = 3, alpha = .5) +
+  geom_smooth(method = "lm") +
+  labs(title = "Deaths vs. vaccine acceptance",
+       x = "New COVID deaths per million",
+       y = "Percent of unvaccinated who would accept vaccine")
+
+# # Even excluding cases over 500pm, this still holds
+# vaccine_data %>% filter(cases_pm < 500) %>%
+#   ggplot(aes(x = cases_pm, y = accept)) +
+#     geom_point(size = .1, shape = 3, alpha = .5) +
+#     geom_smooth(method = "lm")
+
+ggarrange(ac_plot, ad_plot, align = "h", ncol = 2)
+
+```
+
+## Models
+
+In order to determine the relationship between stringency of vaccine measures, I began by collapsing the time dimension of the data and fitting a simple linear regression model predicting vaccine acceptance rates with the Oxford Stringency Index. I then fit additional models which control for cases per million and deaths per million. 
+
+In addition to these models, I fit a series of models which consider the temporal dimension of the data by fitting a model separately for each week (noting that one week in May and one week in November are removed due to scarcity of data). These models predict acceptance, with one set using cases per million as a covariate and another set using deaths per million as a covariate. I then examined the 95% confidence intervals for the coefficients associated with stringency index.
+
+Finally, in order to understand the relationship between individual NPIs and vaccine acceptance, I fit models using each and indicator variable for each NPI as well as either cases or deaths.
+
+
+```{r model-fit}
+# fit models with data collapsed along time
+
+# models with only stringency index (not specific NPIs)
+model_si <- lm(accept ~ stringency_index, data = vaccine_data)
+model_cases <- lm(accept ~ cases_pm, data = vaccine_data)
+model_deaths <- lm(accept ~ deaths_pm, data = vaccine_data)
+
+model_si_cases <- lm(accept ~ stringency_index + cases_pm, data = vaccine_data)
+model_si_deaths <- lm(accept ~ stringency_index + deaths_pm, data = vaccine_data)
+
+model_vax_cases <- lm(accept ~ vaxxed_ph + cases_pm, data = vaccine_data)
+model_vax_deaths <- lm(accept ~ vaxxed_ph + deaths_pm, data = vaccine_data)
+model_vax_cases_si <- lm(accept ~ vaxxed_ph + stringency_index + cases_pm, data = vaccine_data)
+model_vax_deaths_si <- lm(accept ~ vaxxed_ph + stringency_index + deaths_pm, data = vaccine_data)
+
+# Models with each measure separately as indicator
+full_formula <- paste("accept", '~', 
+                      paste(measure_cols$who_measure, collapse=' + ' ), 
+                      "+ cases_pm")
+model_measures_cases <- lm(as.formula(full_formula), data = measures_wide)
+full_formula2 <- paste("accept", '~', 
+                       paste(measure_cols$who_measure, 
+                       collapse=' + ' ), "+ deaths_pm")
+model_measures_deaths <- lm(as.formula(full_formula2), data = measures_wide)
+```
+
+
+```{r time-series}
+# Fit models separately for each week (using stringency index and cases/deaths)
+cross_df <- data.frame(date = weeks$start,
+                       coef = NA,
+                       lwr = NA,
+                       upr = NA) %>%
+  filter(date != "20210517",
+         date != "20211115")
+
+for(i in 1:nrow(cross_df)){
+  this_data = ymd(cross_df$date[i])
+  new_data <- vaccine_data %>% filter(date == this_data)
+  model <- lm(accept ~ stringency_index + deaths_pm, data = new_data)
+  cross_df$coef[i] = model$coefficients[2]
+  cross_df$lwr[i] = confint(model)[2, 1]
+  cross_df$upr[i] = confint(model)[2, 2]
+}
+
+cross_df$date = ymd(cross_df$date)
+cross_df$contains_0 = cross_df$lwr > 0
+
+cases_df <- data.frame(date = weeks$start,
+                       coef = NA,
+                       lwr = NA,
+                       upr = NA) %>%
+  filter(date != "20210517",
+         date != "20211115")
+
+for(i in 1:nrow(cases_df)){
+  this_data = ymd(cases_df$date[i])
+  new_data <- vaccine_data %>% filter(date == this_data)
+  model <- lm(accept ~ stringency_index + cases_pm, data = new_data)
+  cases_df$coef[i] = model$coefficients[2]
+  cases_df$lwr[i] = confint(model)[2, 1]
+  cases_df$upr[i] = confint(model)[2, 2]
+}
+
+cases_df$date = ymd(cases_df$date)
+cases_df$contains_0 = cases_df$lwr > 0
+
+# Note that "cross_df" contains coefficents and CIs when controlling for deaths
+# "cases_df" contains coefficients and CIs when controlling for cases
+```
+
+
+# Results
+
+As shown in Table \ref{tab:models}, the Oxford Stringency Index is indeed a significant positive predictor of rates of vaccine acceptance, and this holds true when controlling for cases as well as when controlling for deaths. When deaths per million is used alone as a predictor, it is significantly positively associated with vaccine acceptance; however, when stringency is added, deaths per million becomes insignificant. Figure \ref{fig:grouped-line-plots} shows how the relationship between stringency and acceptance rates is different for different tercile levels of cases and deaths.
+
+```{r models, results = "asis"}
+models <- list(model_si, model_cases, model_deaths, model_si_cases, model_si_deaths)
+
+stargazer(model_si, model_cases, model_deaths, model_si_cases, model_si_deaths,
+          title="Models fitted exploring relationship between cases, deaths, and stringency index (collapsed over time)",
+          report = "vcs*",
+          no.space = TRUE,
+          header=FALSE,
+          font.size = "small",
+          intercept.bottom = TRUE,
+          covariate.labels = c("Stringency Index", "Cases per million", "Deaths per million"),
+          column.labels = c("Stringency alone", "Cases alone", "Deaths alone", 
+                            "Stringency + cases", "Stringency + deaths"),
+          column.separate = c(1,1,1,1),
+          digits = 2,
+          t.auto = FALSE,
+          p.auto = FALSE,
+          notes.align = "l",
+          notes.append = TRUE,
+          df = FALSE,
+          label = paste0("tab:", knitr::opts_current$get("label"))
+          )
+```
+
+```{r models2, results = "asis"}
+models <- list(model_vax_cases, model_vax_deaths, model_vax_cases_si, model_vax_deaths_si)
+stargazer(model_vax_cases, model_vax_deaths, model_vax_cases_si, model_vax_deaths_si,
+          title="Models fitted exploring relationship between cases, deaths, stringency, and vaccination rates",
+          type = "latex",
+          float = TRUE,
+          report = "vcs*",
+        #  se=lapply(models, function(x) sqrt(diag(vcovHC(x, type = "HC1")))),
+          no.space = TRUE,
+          header=FALSE,
+          single.row = FALSE,
+          font.size = "small",
+          intercept.bottom = TRUE,
+        covariate.labels = c("People vaccinated per hundred", "Stringency Index", 
+                             "Cases per million", "Deaths per million"),
+          column.labels = c("Vaccinated", "Vaccinated", "Vaccinated + SI", "Vaccinated + SI"),
+          column.separate = c(1,1,1,1,1),
+          digits = 2,
+          t.auto = F,
+          p.auto = F,
+          notes.align = "l",
+          notes.append = TRUE,
+          df = FALSE,
+          label = paste0("tab:", knitr::opts_current$get("label"))
+          )
+```
+
+```{r grouped-line-plots, fig.height=6, fig.cap="Relationships between NPI stringency and vaccine acceptance rates, separated by terciles for cases and for deaths. Colored lines indicate simple OLS model fit for the subset defined by the tercile indicated."}
+sac_plot <- ggplot(vaccine_data, aes(x = stringency_index, y = accept, 
+                         group = cases_group, color = cases_group)) +
+  geom_point(color = "black", size = .5, shape = 3, alpha = .5) +
+  geom_smooth(method = "lm") +
+  labs(title = "Relationship between stringency and vaccine acceptance",
+       color = "Case rate terciles",
+       y = "Percent of unvaccinated who\nwould accept vaccine")
+
+sad_plot <- ggplot(vaccine_data, aes(x = stringency_index, y = accept, 
+                         group = death_group, color = death_group)) +
+  geom_point(color = "black", size = .5, shape = 3, alpha = .5) +
+  geom_smooth(method = "lm") +
+  labs(color = "Death rate terciles",
+       y = "Percent of unvaccinated who\nwould accept vaccine")
+
+ggarrange(sac_plot, sad_plot, align = "hv", ncol = 1)
+```
+
+
+```{r time-series-cases-graph, fig.cap="In week-by-week models including number of cases as a covariate, nonadjusted p-values for the index associated with stringency index only sometimes reached the .05 significance threshold."}
+ggplot(cases_df, aes(x = date, y = coef)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr, color = contains_0)) +
+  labs(title = "Stringency index coefficient in model controlling for cases",
+       x = "Date",
+         color = "Coeffient significant?",
+       y = "Estimated coefficient")
+
+```
+
+
+```{r time-series-deaths-graph, fig.cap="In week-by-week models including number of deaths as a covariate, nonadjusted p-values for the index associated with stringency index only sometimes reached the .05 significance threshold."}
+ggplot(cross_df, aes(x = date, y = coef)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr, color = contains_0)) +
+  labs(title = "Stringency index coefficient in model controlling for deaths",
+       x = "Date",
+         color = "Coeffient significant?",
+       y = "Estimated coefficient")
+
+```
+
+
+As shown in Figures \ref{fig:time-series-cases-graph} and \ref{fig:time-series-deaths-graph}, the coefficients associated with the stringency index do follow a discernible trend over time. However, even when the significance testing methods are not adjusted for multiple testing, the stringency index coefficient in the models predicting vaccine acceptance are only sometimes significant. 
+
+In order to understand how different interventions might be associated with different changes in vaccine acceptance, consider Figure \ref{fig:measure-means} which shows the average rate of vaccine acceptance among the unvaccinated and its associated 95% confidence interval.
+
+```{r measure-means, fig.height=8, fig.cap="Different NPIs are associated with different average vaccine acceptance rates"}
+measures_data %>%
+  filter(!is.na(accept)) %>%
+  group_by(who_measure) %>%
+  summarise(count = n(),
+            req_count = sum(req == 1),
+            mean_accept = mean(accept),
+            lwr = mean_accept - 1.96*sd(accept)/sqrt(count),
+            upr = mean_accept + 1.96*sd(accept)/sqrt(count)) %>%
+  ggplot(aes(x = reorder(who_measure, mean_accept), y = mean_accept)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = .5) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) +
+  labs(title = "Average vaccine acceptance rates when each measure\nis implemented",
+       x = "Measure", y = "Percent of unvaccinated who would accept vaccine")
+```
+
+To further quantify these differences, consider the linear models presented in Table \ref{tab:measures} and Figure \ref{fig:model-graphs}. These models predict vaccine acceptance rate using a binary predictor variable for each NPI and including either cases or deaths as a covariate.
+
+```{r measures, results = "asis"}
+models <- list(model_measures_cases, model_measures_deaths)
+
+measure_cols$linebreaks_n = sapply(str_replace_all(measure_cols$who_measure, "_", " "), 
+                                 function(x) str_wrap(x, width = 60))
+measure_cols$linebreaks_latex = linebreak(measure_cols$linebreaks_n, align = "l")
+
+stargazer(model_measures_cases, model_measures_deaths,
+          title="Linear models predicting acceptance rates with NPIs, controlling for cases and deaths",
+          type = "latex",
+          float = TRUE,
+          report = "vcs*",
+          no.space = TRUE,
+          header=FALSE,
+          single.row = TRUE,
+          font.size = "small",
+          intercept.bottom = TRUE,
+          covariate.labels = c(measure_cols$linebreaks_latex, 
+                               "Cases per million", "Deaths per million"),
+          dep.var.labels = c("Controlling for cases", "Controling for deaths"),
+          column.separate = c(1,1),
+          digits = 2,
+          t.auto = F,
+          p.auto = F,
+          notes.align = "l",
+          notes.append = TRUE,
+        df = FALSE,
+         label = paste0("tab:", knitr::opts_current$get("label")),
+        omit.stat = c("adj.rsq", "f")
+          )
+```
+
+
+```{r model-graphs, fig.height=8, fig.cap="Model coefficients and confidence intervals show relationships between NPIs and vaccine acceptance when controlling for cases and deaths"}
+cases_model_df <- data.frame(names = names(model_measures_cases$coefficients),
+                              coef = model_measures_cases$coefficients,
+                             se = summary(model_measures_cases)$coefficients[,2])
+cases_model_df$upr <- cases_model_df$coef + 1.96*cases_model_df$se
+cases_model_df$lwr <- cases_model_df$coef - 1.96*cases_model_df$se
+cases_model_df <- cases_model_df %>% filter(names != "(Intercept)")
+cases_model_df$control_var = "Cases"
+
+deaths_model_df <- data.frame(names = names(model_measures_deaths$coefficients),
+                              coef = model_measures_deaths$coefficients,
+                             se = summary(model_measures_deaths)$coefficients[,2])
+deaths_model_df$upr <- deaths_model_df$coef + 1.96*deaths_model_df$se
+deaths_model_df$lwr <- deaths_model_df$coef - 1.96*deaths_model_df$se
+deaths_model_df <- deaths_model_df %>% filter(names != "(Intercept)")
+deaths_model_df$control_var <- "Deaths"
+
+model_df <- rbind(cases_model_df, deaths_model_df)
+
+model_df$names <- str_replace_all(model_df$names, "_", " ")
+
+ggplot(model_df, aes(x = reorder(names, coef), y = coef)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = .5) +
+  facet_grid(vars(control_var)) +
+  labs(title = "Coefficients for measures used to predict vaccine acceptance,\ncontrolling for cases/deaths per million",
+       y = "Model coefficients (predicing vaccine acceptance rates)", x = "Measure") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5))
+
+```
+
+# Discussion
+
+One unexpected result from this analysis is that COVID case rates were negatively correlated with vaccine acceptance rates. There are numerous plausible explanations for this, with perhaps the most straightforward being that greater vaccine hesitancy would lead to lower rates of vaccination and hence higher case numbers. Additionally, it seems plausible that communities which feel greater distrust of governments or scientists would both show more vaccine hesitancy and adhere less to NPIs, which would lead to higher COVID case rates. When considering models which account for vaccination rates, it appears that different rates of actually receive vaccination can explain part but not all of this relationship.
+
+Despite the unexpected relationship between COVID case rates and vaccine acceptance rates, the finding holds that NPI stringency is positively associated with vaccine acceptance, and that this relationship is moderated by COVID case and death rates. Furthermore, different NPIs vary considerably in their association with vaccine acceptance. Public awareness campaigns, disinfecting surfaces, restricting international ships, and restricting internal travel are associated with some of the highest rates of vaccine acceptance in the models which include cases and deaths. Legal regulations, isolation, and physical distancing are associated with some of the lowest vaccine acceptance rates. These categories illustrate some to the limitations of the taxonomy used, since any of the above items could be classified as legal regulations. The relatively high magnitude of the coefficients for public awareness campaigns and restrictions on internal travel may provide support for the hypothesis that NPIs affecting a broader range of people are associated with higher vaccine acceptance rates. Further analysis would be required to make definitive or causal statements.
+
+This project has a number of limitations. Vaccine acceptance data from some countries and territories is missing, including large countries such as the U.S. and China. The implementation of the Global COVID-19 Trends and Impact Survey via Facebook creates the possibility of systemic bias in the results, such as underrepresentation of those without reliable internet access. Furthermore, it is difficult to state the stringency of a country's COVID NPI policies when those policies often differ by region. Additionally, causality cannot be inferred. For example, some unobserved variable may explain the relationship between vaccination acceptance and NPI stringency among certain governments and across time. Finally, this analysis relies heavily on OLS regression models, which are probably unable to detect the kinds of complex signals that we would expect to find in global health data like this. This project should be considered a starting point rather than a conclusive analysis.
+
+# Conclusion
+
+The results presented in this report are limited in a number of ways, and more research is needed to test the hypothesis that more stringent NPI implementation is associated with higher rates of vaccine acceptance. If a causal relationship were to be established, it would have lasting implications for governments around the world. NPIs, despite their downsides of disrupting people's lives, could also serve to encourage vaccination. 
+
+# Appendix
+
+The country ISO code lookup table was downloaded from the [UMD Open Data API lookup table](https://gisumd.github.io/COVID-19-API-Documentation/docs/survey_aggregates.html). 
+
+Oxford's COVID-19 Stringency Index methodology is [available here](https://github.com/OxCGRT/covid-policy-tracker/blob/master/documentation/index_methodology.md). 
